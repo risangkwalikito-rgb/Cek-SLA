@@ -306,6 +306,17 @@ def format_dates(df: pd.DataFrame, cols):
     return out
 
 
+def format_bulan_indonesia(value) -> str:
+    ts = pd.to_datetime(value, errors='coerce')
+    if pd.isna(ts):
+        return '-'
+    bulan = {
+        1: 'Januari', 2: 'Februari', 3: 'Maret', 4: 'April', 5: 'Mei', 6: 'Juni',
+        7: 'Juli', 8: 'Agustus', 9: 'September', 10: 'Oktober', 11: 'November', 12: 'Desember'
+    }
+    return f"{bulan.get(ts.month, ts.month)} {ts.year}"
+
+
 # ----------------------------
 # UI
 # ----------------------------
@@ -359,9 +370,12 @@ if selected_platform != 'Semua':
     filtered = filtered[filtered['Platform'] == selected_platform]
 
 filtered['Melewati Target'] = np.where(filtered['SLA Hari'] > target_sla, 'Ya', 'Tidak')
+filtered['Bulan PR Sort'] = filtered['Tanggal PR'].dt.to_period('M').dt.to_timestamp()
+filtered['Bulan PR'] = filtered['Bulan PR Sort'].apply(format_bulan_indonesia)
 
 selesai = filtered[filtered['Kategori'] == 'Selesai'].copy().sort_values('SLA Hari', ascending=False)
 on_process = filtered[filtered['Kategori'] == 'On Process'].copy().sort_values('SLA Hari', ascending=False)
+pr_belum_po = filtered[filtered['Tanggal PR'].notna() & filtered['Tanggal Selesai'].isna()].copy().sort_values(['Bulan PR Sort', 'SLA Hari'], ascending=[True, False])
 
 max_selesai = int(selesai['SLA Hari'].max()) if not selesai.empty else 0
 mean_selesai = float(selesai['SLA Hari'].mean()) if not selesai.empty else 0.0
@@ -411,6 +425,53 @@ with right:
         )
         fig_open.update_layout(height=500, yaxis_title='', xaxis_title='Hari')
         st.plotly_chart(fig_open, use_container_width=True)
+
+
+st.subheader('Outstanding PR Belum PO per Bulan')
+if pr_belum_po.empty:
+    st.info('Tidak ada pekerjaan yang sudah memiliki PR tetapi belum memiliki tanggal PO/SPBJ/Realisasi pada filter ini.')
+else:
+    outstanding_bulanan = (
+        pr_belum_po.groupby(['Bulan PR Sort', 'Bulan PR'], dropna=False)
+        .agg(
+            jumlah_outstanding=('Judul Pekerjaan', 'count'),
+            aging_rata_rata_hari=('SLA Hari', 'mean'),
+            aging_terlama_hari=('SLA Hari', 'max'),
+            divisi_terlibat=('Divisi', lambda s: ', '.join(sorted({str(v) for v in s if str(v).strip()}))[:150]),
+        )
+        .reset_index()
+        .sort_values('Bulan PR Sort')
+    )
+
+    chart_outstanding, table_outstanding = st.columns([1.3, 1])
+
+    with chart_outstanding:
+        fig_outstanding = px.bar(
+            outstanding_bulanan,
+            x='Bulan PR',
+            y='jumlah_outstanding',
+            hover_data=['aging_rata_rata_hari', 'aging_terlama_hari'],
+            title='Jumlah pekerjaan yang sudah PR tetapi belum PO per bulan PR',
+        )
+        fig_outstanding.update_layout(height=420, xaxis_title='', yaxis_title='Jumlah pekerjaan')
+        st.plotly_chart(fig_outstanding, use_container_width=True)
+
+    with table_outstanding:
+        display_outstanding_bulanan = outstanding_bulanan[[
+            'Bulan PR', 'jumlah_outstanding', 'aging_rata_rata_hari', 'aging_terlama_hari'
+        ]].copy()
+        display_outstanding_bulanan['aging_rata_rata_hari'] = display_outstanding_bulanan['aging_rata_rata_hari'].round(1)
+        st.dataframe(display_outstanding_bulanan, use_container_width=True, hide_index=True)
+
+    st.markdown('**Rincian pekerjaan outstanding per bulan PR**')
+    detail_outstanding = pr_belum_po[[
+        'Bulan PR Sort', 'Bulan PR', 'No', 'Judul Pekerjaan', 'Divisi', 'Sub Divisi',
+        'Lokasi', 'Tanggal PR', 'Status', 'Platform', 'SLA Hari', 'Nilai'
+    ]].copy()
+    detail_outstanding['Nilai'] = detail_outstanding['Nilai'].apply(rupiah_format)
+    detail_outstanding = format_dates(detail_outstanding, ['Tanggal PR'])
+    detail_outstanding = detail_outstanding.sort_values(['Bulan PR Sort', 'SLA Hari'], ascending=[True, False]).drop(columns=['Bulan PR Sort'])
+    st.dataframe(detail_outstanding, use_container_width=True, hide_index=True)
 
 st.subheader('Sebaran SLA per Divisi')
 summary_divisi = (
@@ -484,7 +545,7 @@ st.caption(
 
 # Buat zip agar mudah diunduh bersama requirements.txt
 try:
-    zip_path = '/mnt/data/streamlit_sla_pengadaan_headerfix.zip'
+    zip_path = '/mnt/data/streamlit_sla_pengadaan_outstanding.zip'
     with ZipFile(zip_path, 'w', ZIP_DEFLATED) as zf:
         zf.write('/mnt/data/app.py', arcname='app.py')
         zf.write('/mnt/data/requirements.txt', arcname='requirements.txt')
