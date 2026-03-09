@@ -1,5 +1,6 @@
 import re
 from urllib.parse import urlparse, parse_qs
+from zipfile import ZipFile, ZIP_DEFLATED
 
 import numpy as np
 import pandas as pd
@@ -15,13 +16,13 @@ DEFAULT_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1DPSQo9DLkCUguFqduWP
 # Helpers
 # ----------------------------
 def extract_sheet_id_and_gid(url: str):
-    match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
+    match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', str(url))
     if not match:
         raise ValueError('URL Google Sheets tidak valid.')
     sheet_id = match.group(1)
 
     gid = '0'
-    parsed = urlparse(url)
+    parsed = urlparse(str(url))
     query_gid = parse_qs(parsed.query).get('gid')
     if query_gid and query_gid[0]:
         gid = query_gid[0]
@@ -33,8 +34,9 @@ def extract_sheet_id_and_gid(url: str):
     return sheet_id, gid
 
 
-def build_csv_url(sheet_url: str) -> str:
-    sheet_id, gid = extract_sheet_id_and_gid(sheet_url)
+def build_csv_url(sheet_url: str, gid_override: str = '') -> str:
+    sheet_id, gid_from_url = extract_sheet_id_and_gid(sheet_url)
+    gid = str(gid_override).strip() or gid_from_url
     return f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}'
 
 
@@ -44,11 +46,9 @@ def normalize_col_name(name: str) -> str:
     return name
 
 
-
-
 def standardize_group_label(value: str) -> str:
     text = str(value).strip()
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r'\s+', ' ', text)
     if text in {'', 'nan', 'None'}:
         return ''
 
@@ -73,17 +73,91 @@ def standardize_group_label(value: str) -> str:
 
     return ' '.join(words)
 
+
+def make_unique_columns(columns):
+    seen = {}
+    output = []
+    for col in columns:
+        base = str(col).strip() or 'unnamed'
+        if base not in seen:
+            seen[base] = 0
+            output.append(base)
+        else:
+            seen[base] += 1
+            output.append(f'{base}_{seen[base]}')
+    return output
+
+
+def detect_header_row(raw_df: pd.DataFrame, max_scan_rows: int = 10) -> int:
+    keyword_weights = {
+        'judul': 4,
+        'pekerjaan': 4,
+        'sppbj': 4,
+        'tanggal': 3,
+        'pr': 3,
+        'status': 3,
+        'platform': 2,
+        'divisi': 2,
+        'lokasi': 1,
+        'nilai': 1,
+        'no': 1,
+    }
+
+    best_idx = 0
+    best_score = -1
+
+    for idx in range(min(max_scan_rows, len(raw_df))):
+        row_values = [normalize_col_name(v) for v in raw_df.iloc[idx].fillna('').astype(str).tolist()]
+        row_text = ' | '.join(row_values)
+        score = sum(weight for keyword, weight in keyword_weights.items() if keyword in row_text)
+
+        non_empty = sum(1 for v in row_values if v)
+        unique_non_empty = len(set(v for v in row_values if v))
+        score += min(non_empty, 10) * 0.1
+        score += min(unique_non_empty, 10) * 0.1
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    return best_idx
+
+
+def read_sheet_with_header(csv_url: str, header_mode: str, manual_header_row: int):
+    raw = pd.read_csv(csv_url, header=None)
+    raw = raw.dropna(how='all')
+    raw = raw.loc[:, ~raw.isna().all(axis=0)]
+    if raw.empty:
+        raise ValueError('Sheet kosong atau tidak bisa dibaca.')
+
+    if header_mode == 'Manual':
+        header_idx = max(int(manual_header_row) - 1, 0)
+        if header_idx >= len(raw):
+            raise ValueError('Baris header manual melebihi jumlah baris sheet.')
+    else:
+        header_idx = detect_header_row(raw)
+
+    header = raw.iloc[header_idx].fillna('').astype(str).str.strip().tolist()
+    header = make_unique_columns(header)
+
+    df = raw.iloc[header_idx + 1:].copy()
+    df.columns = header
+    df = df.dropna(how='all')
+    df = df.loc[:, [str(c).strip() != '' for c in df.columns]]
+    df.columns = [str(c).strip() for c in df.columns]
+
+    return df.reset_index(drop=True), header_idx + 1
+
+
 def find_best_column(columns, keywords_all=None, keywords_any=None):
     keywords_all = keywords_all or []
     keywords_any = keywords_any or []
     normalized = {col: normalize_col_name(col) for col in columns}
 
-    # strict match first
     for original, col in normalized.items():
         if all(k in col for k in keywords_all) and (not keywords_any or any(k in col for k in keywords_any)):
             return original
 
-    # fallback to any keyword match score
     scored = []
     for original, col in normalized.items():
         score = sum(1 for k in keywords_all if k in col) + sum(1 for k in keywords_any if k in col)
@@ -99,26 +173,25 @@ def find_best_column(columns, keywords_all=None, keywords_any=None):
 def map_columns(df: pd.DataFrame):
     cols = list(df.columns)
     mapping = {
-        'no': find_best_column(cols, keywords_all=['no']),
-        'judul': find_best_column(cols, keywords_any=['judul pekerjaan', 'judul pekerjaan / sppbj', 'pekerjaan']),
+        'no': find_best_column(cols, keywords_any=['no']),
+        'judul': find_best_column(cols, keywords_any=['judul pekerjaan', 'judul pekerjaan / sppbj', 'judul', 'pekerjaan', 'sppbj']),
         'divisi': find_best_column(cols, keywords_any=['divisi']),
         'sub_divisi': find_best_column(cols, keywords_any=['sub divisi', 'sub_divisi']),
         'lokasi': find_best_column(cols, keywords_any=['lokasi']),
-        'tanggal_pr': find_best_column(cols, keywords_all=['tanggal', 'pr'], keywords_any=['pembuatan']),
-        'tanggal_selesai': find_best_column(cols, keywords_all=['tanggal'], keywords_any=['realisasi', 'po /spbj', 'po/spbj', 'po / spbj']),
+        'tanggal_pr': find_best_column(cols, keywords_all=['tanggal'], keywords_any=['pembuatan pr', 'pr', 'tanggal pembuatan pr']),
+        'tanggal_selesai': find_best_column(cols, keywords_all=['tanggal'], keywords_any=['realisasi', 'po /spbj', 'po/spbj', 'po / spbj', 'spbj', 'po']),
         'status': find_best_column(cols, keywords_any=['status']),
         'platform': find_best_column(cols, keywords_any=['platform']),
-        'nilai': find_best_column(cols, keywords_any=['nilai pekerjaan', 'nilai po', 'nilai spbj']),
+        'nilai': find_best_column(cols, keywords_any=['nilai pekerjaan', 'nilai po', 'nilai spbj', 'nilai']),
     }
     return mapping
 
 
 def parse_date_series(series: pd.Series) -> pd.Series:
     cleaned = series.astype(str).str.strip()
-    cleaned = cleaned.replace({'': np.nan, 'nan': np.nan, 'NaT': np.nan})
+    cleaned = cleaned.replace({'': np.nan, 'nan': np.nan, 'NaT': np.nan, 'None': np.nan})
     parsed = pd.to_datetime(cleaned, errors='coerce', dayfirst=True)
 
-    # fallback for values that may be interpreted in month/day/year format
     unresolved = parsed.isna() & cleaned.notna()
     if unresolved.any():
         parsed_fallback = pd.to_datetime(cleaned[unresolved], errors='coerce', dayfirst=False)
@@ -154,10 +227,9 @@ def rupiah_format(x):
 
 
 @st.cache_data(show_spinner=False)
-def load_data(sheet_url: str):
-    csv_url = build_csv_url(sheet_url)
-    df = pd.read_csv(csv_url)
-    df.columns = [str(c).strip() for c in df.columns]
+def load_data(sheet_url: str, gid_override: str, header_mode: str, manual_header_row: int):
+    csv_url = build_csv_url(sheet_url, gid_override)
+    df, detected_header_row = read_sheet_with_header(csv_url, header_mode, manual_header_row)
 
     mapping = map_columns(df)
     required = ['judul', 'tanggal_pr', 'status']
@@ -185,12 +257,15 @@ def load_data(sheet_url: str):
     work['Tanggal Acuan'] = work['Tanggal Selesai'].fillna(today)
     work['SLA Hari'] = (work['Tanggal Acuan'] - work['Tanggal PR']).dt.days
 
-    # clean impossible / invalid durations
+    total_rows_awal = len(work)
+    invalid_tanggal_pr = int(work['Tanggal PR'].isna().sum())
+    invalid_sla = int(work['SLA Hari'].isna().sum())
+    negative_sla = int((work['SLA Hari'] < 0).fillna(False).sum())
+
     work = work[work['Tanggal PR'].notna()].copy()
     work = work[work['SLA Hari'].notna()].copy()
     work = work[work['SLA Hari'] >= 0].copy()
 
-    # optional numeric amount parsing
     if mapping.get('nilai'):
         raw_nilai = df[mapping['nilai']].astype(str)
         numeric = (
@@ -210,7 +285,16 @@ def load_data(sheet_url: str):
     work['Status'] = work['Status'].fillna('')
     work['Judul Pekerjaan'] = work['Judul Pekerjaan'].fillna('Tanpa Judul')
 
-    return work, mapping, csv_url
+    audit = {
+        'header_row_terbaca': detected_header_row,
+        'jumlah_baris_awal': total_rows_awal,
+        'tanggal_pr_tidak_terbaca': invalid_tanggal_pr,
+        'sla_tidak_terhitung': invalid_sla,
+        'sla_negatif': negative_sla,
+        'jumlah_baris_final': len(work),
+    }
+
+    return work, mapping, csv_url, audit
 
 
 def format_dates(df: pd.DataFrame, cols):
@@ -231,14 +315,18 @@ st.caption('Menyorot pekerjaan dengan SLA terlama, baik yang sudah selesai maupu
 with st.sidebar:
     st.header('Sumber Data')
     sheet_url = st.text_input('URL Google Sheets', value=DEFAULT_SHEET_URL)
+    gid_override = st.text_input('GID Sheet/Tab (opsional)', value='')
+    header_mode = st.radio('Mode pembacaan header', ['Otomatis', 'Manual'], horizontal=True)
+    manual_header_row = st.number_input('Header ada di baris ke-', min_value=1, max_value=20, value=2, step=1)
     target_sla = st.number_input('Target SLA (hari)', min_value=1, max_value=365, value=30, step=1)
     top_n = st.slider('Top pekerjaan yang ditampilkan', min_value=5, max_value=30, value=15, step=1)
     include_double = st.checkbox('Tampilkan status Double / Review', value=False)
 
 try:
-    data, column_map, csv_url = load_data(sheet_url)
+    data, column_map, csv_url, audit = load_data(sheet_url, gid_override, header_mode, int(manual_header_row))
 except Exception as e:
     st.error(f'Gagal memuat data: {e}')
+    st.info('Coba ubah Mode pembacaan header ke Manual lalu isi "Header ada di baris ke-" = 2.')
     st.stop()
 
 with st.expander('Info pembacaan data'):
@@ -246,6 +334,8 @@ with st.expander('Info pembacaan data'):
     st.code(csv_url)
     st.write('Pemetaan kolom yang terdeteksi:')
     st.json(column_map)
+    st.write('Audit pembacaan data:')
+    st.json(audit)
 
 if not include_double:
     data = data[data['Kategori'] != 'Double / Review'].copy()
@@ -292,7 +382,7 @@ with left:
         st.info('Tidak ada data pekerjaan selesai pada filter ini.')
     else:
         chart_done = selesai.head(top_n).copy()
-        chart_done['Label'] = chart_done['Judul Pekerjaan'].str.slice(0, 70)
+        chart_done['Label'] = chart_done['Judul Pekerjaan'].astype(str).str.slice(0, 70)
         fig_done = px.bar(
             chart_done.sort_values('SLA Hari', ascending=True),
             x='SLA Hari',
@@ -310,7 +400,7 @@ with right:
         st.info('Tidak ada data on process pada filter ini.')
     else:
         chart_open = on_process.head(top_n).copy()
-        chart_open['Label'] = chart_open['Judul Pekerjaan'].str.slice(0, 70)
+        chart_open['Label'] = chart_open['Judul Pekerjaan'].astype(str).str.slice(0, 70)
         fig_open = px.bar(
             chart_open.sort_values('SLA Hari', ascending=True),
             x='SLA Hari',
@@ -391,3 +481,12 @@ st.caption(
     'Definisi SLA pada dashboard ini: selisih hari dari Tanggal Pembuatan PR sampai '
     'Tanggal PO/SPBJ/Realisasi. Untuk item yang belum selesai, SLA dihitung sebagai aging sampai hari ini.'
 )
+
+# Buat zip agar mudah diunduh bersama requirements.txt
+try:
+    zip_path = '/mnt/data/streamlit_sla_pengadaan_headerfix.zip'
+    with ZipFile(zip_path, 'w', ZIP_DEFLATED) as zf:
+        zf.write('/mnt/data/app.py', arcname='app.py')
+        zf.write('/mnt/data/requirements.txt', arcname='requirements.txt')
+except Exception:
+    pass
